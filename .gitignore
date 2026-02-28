@@ -1,0 +1,14 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Scan data (large binary files)
+scans/
+
+# Backup versions
+*_v1.py
+
+# IDE
+.vscode/
+.idea/
