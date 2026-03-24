@@ -4,11 +4,9 @@
 lidar:
   ip: "192.168.1.171"
   host_ip: "192.168.1.50"
-  interface: "enx6c1ff76add18"
+  interface: "enp0s31f6"
   slam_config: "~/ws_livox/config/rko_lio_mid360.yaml"
   bag_topics:
-    - /livox/lidar
-    - /livox/imu
     - /rko_lio/local_map
     - /rko_lio/odometry
     - /rko_lio/frame
@@ -30,6 +28,10 @@ capture:
 
 processing:
   # LiDAR export
+  lidar_fov_filter: true
+  lidar_fov_h_deg: 87.0    # D455 color camera horizontal FOV
+  lidar_fov_v_deg: 58.0    # D455 color camera vertical FOV
+  lidar_min_range_m: 0.5
   lidar_voxel_size: 0.01
   lidar_outlier_neighbors: 50
   lidar_outlier_std: 1.5
@@ -62,3 +64,4 @@ projection:
 paths:
   scan_dir: "~/fusion_pipeline/scans"
   threed_room_src: "~/3dRoom/src"
+  permanent_extrinsic: "~/.config/lidar_rgb/extrinsic.json"

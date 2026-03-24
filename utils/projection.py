@@ -3,95 +3,6 @@ Camera projection and Z-buffer utilities for coloring LiDAR points from RGB imag
 """
 
 import numpy as np
-import open3d as o3d
-
-
-def depth_to_pointcloud(depth_image, fx, fy, cx, cy, max_depth_m=3.0):
-    """Vectorized depth unprojection → Open3D PointCloud (in camera frame)."""
-    h, w = depth_image.shape
-    u, v = np.meshgrid(np.arange(w), np.arange(h))
-    u = u.astype(np.float64).ravel()
-    v = v.astype(np.float64).ravel()
-    z = depth_image.ravel().astype(np.float64) / 1000.0
-
-    valid = (z > 0.1) & (z < max_depth_m)
-    u, v, z = u[valid], v[valid], z[valid]
-
-    x = (u - cx) * z / fx
-    y = (v - cy) * z / fy
-    points = np.stack([x, y, z], axis=1)
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    return pcd
-
-
-def refine_camera_pose(lidar_world_pts, depth_image, T_cam_initial, fx, fy, cx, cy,
-                       max_depth_m=3.0, voxel_size=0.05):
-    """
-    Refine camera-from-world pose by ICP-aligning D455 depth cloud to LiDAR world cloud.
-
-    Args:
-        lidar_world_pts: (N, 3) LiDAR points in world frame
-        depth_image: (H, W) uint16 depth in mm
-        T_cam_initial: (4, 4) initial camera-from-world transform
-        fx, fy, cx, cy: D455 intrinsics
-        max_depth_m: max depth for unprojection
-        voxel_size: voxel size for ICP
-
-    Returns:
-        T_cam_refined: (4, 4) refined camera-from-world transform
-        fitness: ICP fitness (0-1)
-    """
-    # Create D455 depth cloud in camera frame
-    d455_cam = depth_to_pointcloud(depth_image, fx, fy, cx, cy, max_depth_m)
-    if len(d455_cam.points) < 200:
-        return T_cam_initial, 0.0
-
-    # Initial world-from-camera
-    T_world_cam_init = np.linalg.inv(T_cam_initial)
-    cam_pos = T_world_cam_init[:3, 3]
-
-    # Crop LiDAR points near camera
-    crop_radius = max_depth_m + 0.5
-    dists = np.linalg.norm(lidar_world_pts - cam_pos, axis=1)
-    nearby = lidar_world_pts[dists < crop_radius]
-
-    if len(nearby) < 500:
-        return T_cam_initial, 0.0
-
-    lidar_crop = o3d.geometry.PointCloud()
-    lidar_crop.points = o3d.utility.Vector3dVector(nearby)
-
-    # Transform D455 to world frame using initial guess
-    d455_world = o3d.geometry.PointCloud(d455_cam)
-    d455_world.transform(T_world_cam_init)
-
-    # Downsample
-    d455_down = d455_world.voxel_down_sample(voxel_size)
-    lidar_down = lidar_crop.voxel_down_sample(voxel_size)
-
-    # Normals on target
-    lidar_down.estimate_normals(
-        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30)
-    )
-
-    # ICP: refine D455-in-world against LiDAR-in-world
-    result = o3d.pipelines.registration.registration_icp(
-        d455_down, lidar_down,
-        voxel_size * 2,  # max correspondence distance
-        np.eye(4),  # identity initial (D455 already in world via initial guess)
-        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-        o3d.pipelines.registration.ICPConvergenceCriteria(
-            relative_fitness=1e-7, relative_rmse=1e-7, max_iteration=50,
-        ),
-    )
-
-    # result.transformation is the correction: T_corrected_world = correction @ T_initial_world
-    T_world_cam_refined = result.transformation @ T_world_cam_init
-    T_cam_refined = np.linalg.inv(T_world_cam_refined)
-
-    return T_cam_refined, result.fitness
 
 
 def project_points_to_image(points_world, T_cam_from_world, fx, fy, cx, cy, image_h, image_w):
@@ -289,8 +200,6 @@ def color_points_multi_frame(points_world, frames, zbuffer_tolerance=0.05,
     n = len(points_world)
     color_sum = np.zeros((n, 3), dtype=np.float64)
     color_count = np.zeros(n, dtype=np.int32)
-    depth_reject_total = 0
-    depth_pass_total = 0
 
     for i, frame in enumerate(frames):
         indices, colors, depths = color_points_from_frame(

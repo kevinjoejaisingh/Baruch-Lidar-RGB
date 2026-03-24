@@ -213,7 +213,8 @@ def create_grid_display(frame1_rgb, frame1_depth_col, live_rgb, live_depth_col,
     return np.vstack([top_row, bottom_row])
 
 
-def save_d455_frame(d455_dir, frame_num, rgb_image, depth_frame, imu_data, is_loop_closure=False):
+def save_d455_frame(d455_dir, frame_num, rgb_image, depth_frame, imu_data,
+                    frame_timestamp_ns=None, is_loop_closure=False):
     """Save RGB PNG, depth PNG (16-bit mm), and IMU JSON for one D455 frame."""
     prefix = f"frame_{frame_num:03d}"
 
@@ -227,9 +228,11 @@ def save_d455_frame(d455_dir, frame_num, rgb_image, depth_frame, imu_data, is_lo
     cv2.imwrite(depth_path, depth_image)
 
     # IMU JSON with capture_timestamp_ns for LiDAR sync
+    # Use hardware frame timestamp if provided, else fall back to wall clock
+    ts_ns = frame_timestamp_ns if frame_timestamp_ns is not None else time.time_ns()
     imu_json = {
         "frame_number": frame_num,
-        "capture_timestamp_ns": time.time_ns(),
+        "capture_timestamp_ns": ts_ns,
         "timestamp_ms": time.time() * 1000,
         "accelerometer": {
             "x": imu_data["accel"][0],
@@ -459,7 +462,9 @@ def main():
                     "pitch": current_pitch,
                     "roll": current_roll,
                 }
-                save_d455_frame(str(d455_path), frame_count, color_image, depth_frame, imu_data)
+                hw_ts_ns = int(color_frame.get_timestamp() * 1_000_000)
+                save_d455_frame(str(d455_path), frame_count, color_image, depth_frame,
+                                imu_data, frame_timestamp_ns=hw_ts_ns)
 
                 if frame_count == 1:
                     frame1_rgb = color_image.copy()
@@ -509,8 +514,10 @@ def main():
                     "pitch": current_pitch,
                     "roll": current_roll,
                 }
+                hw_ts_ns = int(color_frame.get_timestamp() * 1_000_000)
                 save_d455_frame(str(d455_path), frame_count, np.asanyarray(color_frame.get_data()),
-                                depth_frame, imu_data, is_loop_closure=True)
+                                depth_frame, imu_data, frame_timestamp_ns=hw_ts_ns,
+                                is_loop_closure=True)
                 print(f"  Loop-closure frame {frame_count} captured")
 
         # Stop D455

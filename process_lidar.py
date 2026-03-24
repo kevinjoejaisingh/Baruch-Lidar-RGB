@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -43,6 +44,20 @@ with open(CONFIG_PATH) as f:
 VOXEL_SIZE = CFG["processing"]["lidar_voxel_size"]
 OUTLIER_NB = CFG["processing"]["lidar_outlier_neighbors"]
 OUTLIER_STD = CFG["processing"]["lidar_outlier_std"]
+MIN_RANGE_M = CFG["processing"]["lidar_min_range_m"]
+
+FOV_FILTER = CFG["processing"]["lidar_fov_filter"]
+H_TAN = np.tan(np.radians(CFG["processing"]["lidar_fov_h_deg"] / 2))
+V_TAN = np.tan(np.radians(CFG["processing"]["lidar_fov_v_deg"] / 2))
+
+if FOV_FILTER:
+    _ext_path = Path(CFG["paths"]["permanent_extrinsic"]).expanduser()
+    with open(_ext_path) as _f:
+        _ext = json.load(_f)
+    _T_lidar_from_d455 = np.array(_ext["transform"], dtype=np.float64)
+    _T_d455_from_lidar = np.linalg.inv(_T_lidar_from_d455)
+    R_D455 = _T_d455_from_lidar[:3, :3].astype(np.float32)
+    t_D455 = _T_d455_from_lidar[:3, 3].astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +198,19 @@ def main():
         points = parse_pc2_vectorized(raw_data, typestore)
         if len(points) == 0:
             continue
+        range_sq = (points ** 2).sum(axis=1)
+        points = points[range_sq >= MIN_RANGE_M ** 2]
+        if len(points) == 0:
+            continue
+        if FOV_FILTER:
+            pts_cam = (R_D455 @ points.T).T + t_D455
+            z = pts_cam[:, 2]
+            fov_mask = (z > 0) & \
+                       (np.abs(pts_cam[:, 0]) <= H_TAN * z) & \
+                       (np.abs(pts_cam[:, 1]) <= V_TAN * z)
+            points = points[fov_mask]
+            if len(points) == 0:
+                continue
         idx = np.argmin(np.abs(odom_times - ft))
         pose = odom_msgs[idx][3]
         frames.append((points, pose, odom_msgs[idx][0]))
