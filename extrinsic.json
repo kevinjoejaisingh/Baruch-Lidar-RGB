@@ -1,0 +1,9 @@
+{
+  "transform": [
+    [ 0.0,  0.5,   0.866,  0.023],
+    [-1.0,  0.0,   0.0,   -0.020],
+    [ 0.0, -0.866, 0.5,   -0.040],
+    [ 0.0,  0.0,   0.0,    1.0  ]
+  ],
+  "notes": "New 3D-printed bracket. Dome ~30deg from vertical (tilted forward). D455 46mm below + 20mm right of LiDAR. INITIAL ESTIMATE - tune with overlay workflow."
+}
