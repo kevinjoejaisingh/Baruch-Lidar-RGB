@@ -22,6 +22,8 @@ import open3d as o3d
 import yaml
 
 from utils.projection import (color_points_from_frame, color_points_multi_frame,
+                               color_points_closest_camera, color_points_first_wins,
+                               color_points_center_weighted,
                                project_points_to_image)
 from utils.timestamps import interpolate_pose_at_timestamp
 
@@ -36,6 +38,8 @@ ZBUF_TOL = CFG["projection"]["zbuffer_tolerance"]
 MAX_DIST = CFG["projection"]["max_distance_m"]
 DEFAULT_COLOR = tuple(CFG["projection"]["default_color"])
 DEPTH_THRESHOLD = CFG["projection"].get("depth_consistency_threshold", 0.10)
+EDGE_EROSION_PX = CFG["projection"].get("edge_erosion_px", 2)
+EDGE_DEPTH_THRESHOLD_MM = CFG["projection"].get("edge_depth_threshold_mm", 300)
 
 
 def load_scan_data(scan_dir):
@@ -150,7 +154,7 @@ def project_single_frame(scan_dir, data, frame_idx):
 
     T_cam = compute_camera_pose_in_lidar_frame(frame_idx, data)
 
-    indices, colors, depths = color_points_from_frame(
+    indices, colors, depths, _pixels = color_points_from_frame(
         data["points"], T_cam,
         data["fx"], data["fy"], data["cx"], data["cy"],
         rgb, ZBUF_TOL,
@@ -325,7 +329,7 @@ def load_d455_depth(scan_dir, frame_num):
     return cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
 
 
-def project_all_frames(scan_dir, data):
+def project_all_frames(scan_dir, data, blend_mode="mean"):
     """Project all frames onto the point cloud."""
     n_frames = len(data["frame_numbers"])
     print(f"\nProjecting {n_frames} frames onto {len(data['points']):,} points...")
@@ -353,12 +357,23 @@ def project_all_frames(scan_dir, data):
 
     print(f"  {len(frames)} frames with images loaded")
 
-    colors, stats = color_points_multi_frame(
+    blend_fns = {
+        "mean": color_points_multi_frame,
+        "closest": color_points_closest_camera,
+        "first": color_points_first_wins,
+        "center_weighted": color_points_center_weighted,
+    }
+    blend_fn = blend_fns[blend_mode]
+    print(f"  Blend mode: {blend_mode}")
+
+    colors, stats = blend_fn(
         data["points"], frames,
         zbuffer_tolerance=ZBUF_TOL,
         max_distance=MAX_DIST,
         default_color=DEFAULT_COLOR,
         depth_threshold=DEPTH_THRESHOLD,
+        erosion_px=EDGE_EROSION_PX,
+        edge_threshold_mm=EDGE_DEPTH_THRESHOLD_MM,
     )
 
     print(f"\nProjection complete:")
@@ -367,6 +382,101 @@ def project_all_frames(scan_dir, data):
     print(f"  Avg frames/colored point: {stats['avg_frames_per_colored_point']:.1f}")
 
     return colors, stats
+
+
+def debug_frame_panels(scan_dir, data, frame_idx):
+    """
+    Generate a 4-panel debug image for a single frame:
+      Top-left:     Raw RGB frame
+      Top-right:    RGB masked to only pixels that hit LiDAR points
+      Bottom-left:  Camera-view render of colored LiDAR points (color from image)
+      Bottom-right: Camera-view render of LiDAR geometry only (white dots, same subset)
+    Saved as debug_panels_frameNNN.png
+    """
+    frame_num = data["frame_numbers"][frame_idx]
+    rgb = load_d455_image(scan_dir, frame_num)
+    if rgb is None:
+        print(f"No image for frame {frame_num}")
+        return
+
+    if data["dist_coeffs"] is not None:
+        rgb = cv2.undistort(rgb, data["camera_matrix"], data["dist_coeffs"])
+
+    T_cam = compute_camera_pose_in_lidar_frame(frame_idx, data)
+    h, w = rgb.shape[:2]
+
+    # Project all LiDAR points into this camera
+    pixel_coords, point_indices, depths = project_points_to_image(
+        data["points"], T_cam,
+        data["fx"], data["fy"], data["cx"], data["cy"],
+        h, w,
+    )
+
+    # Filter by max distance
+    dist_mask = depths < MAX_DIST
+    pixel_coords = pixel_coords[dist_mask]
+    point_indices = point_indices[dist_mask]
+    depths = depths[dist_mask]
+
+    print(f"Frame {frame_num}: {len(pixel_coords):,} LiDAR points projected into image")
+
+    # --- Panel 1: Raw RGB frame ---
+    panel1 = rgb.copy()
+
+    # --- Panel 2: RGB but only pixels that have LiDAR points, rest dimmed ---
+    panel2 = (rgb.astype(np.float32) * 0.15).astype(np.uint8)  # dim everything
+    # Create a mask of pixels that have LiDAR hits
+    hit_mask = np.zeros((h, w), dtype=bool)
+    hit_mask[pixel_coords[:, 1], pixel_coords[:, 0]] = True
+    # Dilate slightly so individual pixels are visible
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    hit_mask_dilated = cv2.dilate(hit_mask.astype(np.uint8), kernel).astype(bool)
+    panel2[hit_mask_dilated] = rgb[hit_mask_dilated]
+
+    # --- Panel 3: Black canvas, draw colored LiDAR points using image colors ---
+    panel3 = np.zeros((h, w, 3), dtype=np.uint8)
+    # Sample colors from RGB image at projected pixel locations
+    colors_sampled = rgb[pixel_coords[:, 1], pixel_coords[:, 0]]
+    # Sort far-to-near so near points draw on top
+    order = np.argsort(depths)[::-1]
+    px_sorted = pixel_coords[order]
+    col_sorted = colors_sampled[order]
+    panel3[px_sorted[:, 1], px_sorted[:, 0]] = col_sorted
+    # Dilate to make points visible
+    kernel3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    panel3 = cv2.dilate(panel3, kernel3)
+
+    # --- Panel 4: Black canvas, draw LiDAR points as white (geometry only) ---
+    panel4 = np.zeros((h, w, 3), dtype=np.uint8)
+    # Depth-shade: closer = brighter white
+    d_min = depths.min()
+    d_max = np.percentile(depths, 98)
+    d_norm = np.clip((depths - d_min) / (d_max - d_min + 1e-6), 0, 1)
+    brightness = ((1.0 - d_norm) * 200 + 55).astype(np.uint8)  # 55-255
+    white_colors = np.stack([brightness, brightness, brightness], axis=1)
+    px_sorted4 = pixel_coords[order]
+    wc_sorted = white_colors[order]
+    panel4[px_sorted4[:, 1], px_sorted4[:, 0]] = wc_sorted
+    panel4 = cv2.dilate(panel4, kernel3)
+
+    # --- Labels ---
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for panel, label in [(panel1, "1: Raw RGB"),
+                         (panel2, "2: RGB pixels hitting LiDAR"),
+                         (panel3, "3: LiDAR colored by image"),
+                         (panel4, "4: LiDAR geometry (depth-shaded)")]:
+        cv2.putText(panel, label, (10, 30), font, 0.8, (0, 255, 0), 2)
+
+    # --- Combine 2x2 ---
+    top = np.hstack([panel1, panel2])
+    bot = np.hstack([panel3, panel4])
+    combined = np.vstack([top, bot])
+
+    # Convert RGB to BGR for saving
+    combined_bgr = cv2.cvtColor(combined, cv2.COLOR_RGB2BGR)
+    out_path = scan_dir / f"debug_panels_frame{frame_num:03d}.png"
+    cv2.imwrite(str(out_path), combined_bgr)
+    print(f"Saved: {out_path} ({combined.shape[1]}x{combined.shape[0]})")
 
 
 def main():
@@ -384,6 +494,14 @@ def main():
                         help="Save alignment overlay for every Nth frame across the whole scan")
     parser.add_argument("--dot-radius", type=int, default=3, metavar="R",
                         help="Radius of LiDAR dots in overlay images (default: 3)")
+    parser.add_argument("--blend-mode", choices=["mean", "closest", "first", "center_weighted"],
+                        default="center_weighted",
+                        help="Color blending: 'center_weighted' weights by image center distance (default), "
+                             "'mean' averages all frames uniformly, "
+                             "'closest' keeps color from nearest camera, "
+                             "'first' keeps first valid color")
+    parser.add_argument("--debug-frame", type=int, default=None, metavar="F",
+                        help="Generate 4-panel debug image for frame F")
     args = parser.parse_args()
 
     scan_dir = Path(args.scan_dir).expanduser()
@@ -391,6 +509,14 @@ def main():
 
     print("Loading scan data...")
     data = load_scan_data(scan_dir)
+
+    if args.debug_frame is not None:
+        if args.debug_frame >= len(data["frame_numbers"]):
+            print(f"ERROR: Frame index {args.debug_frame} out of range "
+                  f"(0..{len(data['frame_numbers'])-1})")
+            return 1
+        debug_frame_panels(scan_dir, data, args.debug_frame)
+        return 0
 
     if args.overlay_stride is not None:
         # Sweep mode: generate overlays for every Nth frame
@@ -420,7 +546,7 @@ def main():
         return 0
 
     # Full projection
-    colors, stats = project_all_frames(scan_dir, data)
+    colors, stats = project_all_frames(scan_dir, data, blend_mode=args.blend_mode)
 
     # Fill uncolored points with height-based rainbow colormap
     colored_mask = ~np.all(colors == np.array(DEFAULT_COLOR, dtype=np.uint8), axis=1)

@@ -23,14 +23,16 @@ import open3d as o3d
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from project_color import load_scan_data, compute_camera_pose_in_lidar_frame, load_d455_image
-from utils.projection import project_points_to_image
+from project_color import load_scan_data, compute_camera_pose_in_lidar_frame, load_d455_image, load_d455_depth
+from utils.projection import project_points_to_image, color_points_from_frame
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
 with open(CONFIG_PATH) as f:
     CFG = yaml.safe_load(f)
 
 MAX_DIST = CFG["projection"]["max_distance_m"]
+ZBUF_TOL = CFG["projection"]["zbuffer_tolerance"]
+DEPTH_THRESHOLD = CFG["projection"].get("depth_consistency_threshold", 0.10)
 
 
 def depth_colormap(depths, max_dist=MAX_DIST):
@@ -51,6 +53,8 @@ def main():
                         help="Frame index/indices (0-based) to visualize/combine")
     parser.add_argument("--dot-radius", type=int, default=2,
                         help="Dot radius for projected LiDAR points")
+    parser.add_argument("--sharpness", type=float, default=6.0,
+                        help="Weight curve sharpness (1=smooth/blurry, 6=balanced, 20=first-wins-like)")
     args = parser.parse_args()
 
     scan_dir = args.scan_dir.expanduser()
@@ -59,9 +63,10 @@ def main():
     frame_indices = args.frame
     multi = len(frame_indices) > 1
 
-    # Pre-allocate color buffer over the full cloud — each point colored once
+    # Pre-allocate color buffer — center-weighted blending for multi-frame
     n_pts = len(data["points"])
-    color_buf = np.full((n_pts, 3), -1.0)  # -1 = uncolored
+    color_sum = np.zeros((n_pts, 3), dtype=np.float64)
+    weight_sum = np.zeros(n_pts, dtype=np.float64)
 
     for frame_idx in frame_indices:
         frame_num = data["frame_numbers"][frame_idx]
@@ -74,46 +79,57 @@ def main():
 
         cam_mat = data["camera_matrix"]
         if data["dist_coeffs"] is not None:
-            rgb = cv2.undistort(
-                cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
-                cam_mat, data["dist_coeffs"]
-            )
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+            rgb = cv2.undistort(rgb, cam_mat, data["dist_coeffs"])
 
         H, W = rgb.shape[:2]
 
         T_cam = compute_camera_pose_in_lidar_frame(frame_idx, data)
-        pixels, pt_indices, depths = project_points_to_image(
+        depth_img = load_d455_depth(scan_dir, frame_num)
+
+        # Use proper z-buffer filtering (no depth consistency — too aggressive)
+        pt_indices, colors, depths, pixels = color_points_from_frame(
             data["points"], T_cam,
             data["fx"], data["fy"], data["cx"], data["cy"],
-            H, W
+            rgb, ZBUF_TOL,
         )
 
-        if len(depths) > 0:
-            mask = depths < MAX_DIST
-            pixels = pixels[mask]
-            pt_indices = pt_indices[mask]
-            depths = depths[mask]
+        if len(pt_indices) == 0:
+            print(f"  0 LiDAR points visible")
+            continue
 
-        print(f"  {len(depths):,} LiDAR points visible")
+        # Filter by max distance
+        dist_mask = depths < MAX_DIST
+        pt_indices = pt_indices[dist_mask]
+        colors = colors[dist_mask]
+        pixels = pixels[dist_mask]
+        depths = depths[dist_mask]
 
-        rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        sampled_rgb = rgb_bgr[pixels[:, 1], pixels[:, 0]]  # BGR
+        print(f"  {len(pt_indices):,} LiDAR points visible (z-buffered + depth-checked)")
 
-        # Only color uncolored points (first frame to see a point wins)
-        uncolored = color_buf[pt_indices, 0] < 0
-        color_buf[pt_indices[uncolored]] = sampled_rgb[uncolored, ::-1] / 255.0
+        colors_f = colors.astype(np.float64) / 255.0
+
+        # Center-weighted blending
+        dx = (pixels[:, 0] - data["cx"]) / (W / 2)
+        dy = (pixels[:, 1] - data["cy"]) / (H / 2)
+        dist = np.clip(np.sqrt(dx**2 + dy**2), 0, 1)
+        weights = (0.5 * (1.0 + np.cos(np.pi * dist))) ** args.sharpness
+
+        np.add.at(color_sum, (pt_indices, slice(None)),
+                  colors_f * weights[:, np.newaxis])
+        np.add.at(weight_sum, pt_indices, weights)
 
         # 2D panels — only for single frame
         if not multi:
             dot_colors = depth_colormap(depths)
+            rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            colors_bgr = colors[:, ::-1]  # RGB→BGR
 
             lidar_panel = np.zeros((H, W, 3), dtype=np.uint8)
             overlay_panel = rgb_bgr.copy()
             projected_img_panel = np.zeros((H, W, 3), dtype=np.uint8)
 
             r = args.dot_radius
-            for (u, v), depth_color, rgb_color in zip(pixels, dot_colors, sampled_rgb):
+            for (u, v), depth_color, rgb_color in zip(pixels, dot_colors, colors_bgr):
                 dc = tuple(int(x) for x in depth_color)
                 rc = tuple(int(x) for x in rgb_color)
                 cv2.circle(lidar_panel, (u, v), r, dc, -1)
@@ -122,7 +138,7 @@ def main():
 
             font = cv2.FONT_HERSHEY_SIMPLEX
             for panel, label in [(rgb_bgr, "Camera RGB"),
-                                 (lidar_panel, f"LiDAR projection ({len(depths):,} pts)"),
+                                 (lidar_panel, f"LiDAR projection ({len(depths):,} pts, z-buffered)"),
                                  (overlay_panel, "Overlay"),
                                  (projected_img_panel, "Image projected onto LiDAR")]:
                 cv2.putText(panel, label, (10, 30), font, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
@@ -140,9 +156,10 @@ def main():
             cv2.destroyAllWindows()
 
     # --- Build and save combined 3D cloud ---
-    colored_mask = color_buf[:, 0] >= 0
+    colored_mask = weight_sum > 0
     combined_pts = data["points"][colored_mask]
-    combined_rgb = color_buf[colored_mask]
+    combined_rgb = color_sum[colored_mask] / weight_sum[colored_mask, np.newaxis]
+    combined_rgb = np.clip(combined_rgb, 0, 1)
     print(f"Total unique colored points: {len(combined_pts):,}")
 
     pcd = o3d.geometry.PointCloud()

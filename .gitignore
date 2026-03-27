@@ -12,3 +12,16 @@ scans/
 # IDE
 .vscode/
 .idea/
+
+# Godot editor cache
+godot_viewer/.godot/
+godot_viewer/*.uid
+godot_viewer/export_presets.cfg
+*.bin
+
+# Depth camera captures
+DepthCamera_*.json
+DepthCapture_*.png
+
+# Walk viewer (superseded by Godot viewer)
+walk_viewer.py

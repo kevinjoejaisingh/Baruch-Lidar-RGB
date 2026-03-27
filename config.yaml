@@ -32,7 +32,7 @@ processing:
   lidar_fov_h_deg: 87.0    # D455 color camera horizontal FOV
   lidar_fov_v_deg: 58.0    # D455 color camera vertical FOV
   lidar_min_range_m: 0.5
-  lidar_voxel_size: 0.01
+  lidar_voxel_size: 0.003
   lidar_outlier_neighbors: 50
   lidar_outlier_std: 1.5
   # D455 ICP
@@ -60,6 +60,8 @@ projection:
   max_distance_m: 10.0
   default_color: [128, 128, 128]
   depth_consistency_threshold: 0.10
+  edge_erosion_px: 2           # pixels to erode around depth discontinuities (silhouette cleanup)
+  edge_depth_threshold_mm: 300 # Sobel gradient threshold for depth edge detection (mm)
 
 paths:
   scan_dir: "~/fusion_pipeline/scans"

@@ -2,6 +2,7 @@
 Camera projection and Z-buffer utilities for coloring LiDAR points from RGB images.
 """
 
+import cv2
 import numpy as np
 
 
@@ -111,9 +112,57 @@ def depth_consistency_filter(pixel_coords, depths, depth_image, threshold=0.10):
     return consistent
 
 
+def depth_edge_erosion_filter(pixel_coords, depth_image, erosion_px=2,
+                               edge_threshold_mm=300):
+    """
+    Reject points projecting near depth discontinuities in the camera image.
+
+    At object silhouettes (e.g., tree trunk against sky), LiDAR foreground
+    points can project onto background pixels due to the sensor baseline
+    parallax or small pose errors, picking up incorrect colors (e.g., white
+    sky bleeding onto tree edges).
+
+    Detects sharp depth transitions via Sobel gradient, dilates the edge
+    zone, and rejects any LiDAR point projecting into that exclusion zone.
+
+    Args:
+        pixel_coords: (M, 2) int pixel coordinates (u, v)
+        depth_image: (H, W) uint16 depth in mm
+        erosion_px: radius of exclusion zone around depth edges (pixels)
+        edge_threshold_mm: Sobel gradient magnitude threshold for edge detection
+
+    Returns:
+        mask: (M,) bool — True for points that pass (not near edges)
+    """
+    if depth_image is None or erosion_px <= 0:
+        return np.ones(len(pixel_coords), dtype=bool)
+
+    depth_f = depth_image.astype(np.float32)
+
+    # Sobel gradient to find depth discontinuities
+    grad_x = cv2.Sobel(depth_f, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(depth_f, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+
+    # Mark pixels with large depth jumps
+    edge_mask = (grad_mag > edge_threshold_mm).astype(np.uint8)
+
+    # Dilate to create exclusion zone around edges
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * erosion_px + 1, 2 * erosion_px + 1)
+    )
+    edge_mask = cv2.dilate(edge_mask, kernel)
+
+    # Reject points in the exclusion zone
+    u = pixel_coords[:, 0]
+    v = pixel_coords[:, 1]
+    return edge_mask[v, u] == 0
+
+
 def color_points_from_frame(points_world, T_cam_from_world, fx, fy, cx, cy,
                             rgb_image, zbuffer_tolerance=0.05,
-                            depth_image=None, depth_threshold=0.10):
+                            depth_image=None, depth_threshold=0.10,
+                            erosion_px=2, edge_threshold_mm=300):
     """
     Color world points using a single camera frame.
 
@@ -125,6 +174,8 @@ def color_points_from_frame(points_world, T_cam_from_world, fx, fy, cx, cy,
         zbuffer_tolerance: Z-buffer tolerance in meters
         depth_image: optional (H, W) uint16 depth in mm for consistency check
         depth_threshold: max depth disagreement (meters) before rejecting
+        erosion_px: pixel radius to erode around depth edges (0 to disable)
+        edge_threshold_mm: Sobel gradient threshold for depth edge detection (mm)
 
     Returns:
         colored_indices: (K,) indices into points_world that got colored
@@ -162,18 +213,28 @@ def color_points_from_frame(points_world, T_cam_from_world, fx, fy, cx, cy,
         surv_depths = surv_depths[dc_mask]
         surv_indices = surv_indices[dc_mask]
 
+    # Depth edge erosion — reject points near silhouette boundaries
+    if depth_image is not None and erosion_px > 0:
+        edge_mask = depth_edge_erosion_filter(
+            surv_pixels, depth_image, erosion_px, edge_threshold_mm
+        )
+        surv_pixels = surv_pixels[edge_mask]
+        surv_depths = surv_depths[edge_mask]
+        surv_indices = surv_indices[edge_mask]
+
     if len(surv_indices) == 0:
         return np.empty(0, dtype=np.int64), np.empty((0, 3), dtype=np.uint8), np.empty(0)
 
     # Sample colors from image
     colors = rgb_image[surv_pixels[:, 1], surv_pixels[:, 0]]
 
-    return surv_indices, colors, surv_depths
+    return surv_indices, colors, surv_depths, surv_pixels
 
 
 def color_points_multi_frame(points_world, frames, zbuffer_tolerance=0.05,
                              max_distance=10.0, default_color=(128, 128, 128),
-                             depth_threshold=0.10):
+                             depth_threshold=0.10, erosion_px=2,
+                             edge_threshold_mm=300):
     """
     Color points from multiple camera frames using mean blending with depth verification.
 
@@ -202,7 +263,7 @@ def color_points_multi_frame(points_world, frames, zbuffer_tolerance=0.05,
     color_count = np.zeros(n, dtype=np.int32)
 
     for i, frame in enumerate(frames):
-        indices, colors, depths = color_points_from_frame(
+        indices, colors, depths, pixels = color_points_from_frame(
             points_world,
             frame["T_cam_from_world"],
             frame["fx"], frame["fy"], frame["cx"], frame["cy"],
@@ -210,6 +271,8 @@ def color_points_multi_frame(points_world, frames, zbuffer_tolerance=0.05,
             zbuffer_tolerance,
             depth_image=frame.get("depth_image"),
             depth_threshold=depth_threshold,
+            erosion_px=erosion_px,
+            edge_threshold_mm=edge_threshold_mm,
         )
 
         if len(indices) == 0:
@@ -241,6 +304,202 @@ def color_points_multi_frame(points_world, frames, zbuffer_tolerance=0.05,
         "coverage_pct": float(np.sum(colored_mask) / n * 100),
         "avg_frames_per_colored_point": float(
             np.mean(color_count[colored_mask]) if np.any(colored_mask) else 0
+        ),
+    }
+
+    return best_colors, stats
+
+
+def color_points_closest_camera(points_world, frames, zbuffer_tolerance=0.05,
+                                max_distance=10.0, default_color=(128, 128, 128),
+                                depth_threshold=0.10, erosion_px=2,
+                                edge_threshold_mm=300):
+    """
+    Color points using 'closest camera wins' — each point keeps the color
+    from whichever frame had the smallest depth (camera was closest).
+
+    No averaging. This avoids the blur caused by mean-blending many frames
+    with small pose errors.
+    """
+    n = len(points_world)
+    best_colors = np.full((n, 3), default_color, dtype=np.uint8)
+    best_depth = np.full(n, np.inf, dtype=np.float64)
+    color_count = np.zeros(n, dtype=np.int32)
+
+    for i, frame in enumerate(frames):
+        indices, colors, depths, pixels = color_points_from_frame(
+            points_world,
+            frame["T_cam_from_world"],
+            frame["fx"], frame["fy"], frame["cx"], frame["cy"],
+            frame["rgb_image"],
+            zbuffer_tolerance,
+            depth_image=frame.get("depth_image"),
+            depth_threshold=depth_threshold,
+            erosion_px=erosion_px,
+            edge_threshold_mm=edge_threshold_mm,
+        )
+
+        if len(indices) == 0:
+            continue
+
+        # Filter by max distance
+        dist_mask = depths < max_distance
+        indices = indices[dist_mask]
+        colors = colors[dist_mask]
+        depths = depths[dist_mask]
+
+        # Only update points where this frame's camera is closer
+        closer_mask = depths < best_depth[indices]
+        update_idx = indices[closer_mask]
+        best_colors[update_idx] = colors[closer_mask]
+        best_depth[update_idx] = depths[closer_mask]
+        color_count[update_idx] = 1  # mark as colored
+
+        if (i + 1) % 20 == 0 or i == len(frames) - 1:
+            pct = np.sum(color_count > 0) / n * 100
+            print(f"  Frame {i + 1}/{len(frames)}: {pct:.1f}% colored")
+
+    colored_mask = color_count > 0
+    stats = {
+        "total_points": n,
+        "colored_points": int(np.sum(colored_mask)),
+        "coverage_pct": float(np.sum(colored_mask) / n * 100),
+        "avg_frames_per_colored_point": 1.0,
+    }
+
+    return best_colors, stats
+
+
+def color_points_first_wins(points_world, frames, zbuffer_tolerance=0.05,
+                            max_distance=10.0, default_color=(128, 128, 128),
+                            depth_threshold=0.10, erosion_px=2,
+                            edge_threshold_mm=300):
+    """
+    Color points using 'first valid wins' — once a point is colored by any
+    frame, no subsequent frame can override it.
+    """
+    n = len(points_world)
+    best_colors = np.full((n, 3), default_color, dtype=np.uint8)
+    colored = np.zeros(n, dtype=bool)
+
+    for i, frame in enumerate(frames):
+        indices, colors, depths, pixels = color_points_from_frame(
+            points_world,
+            frame["T_cam_from_world"],
+            frame["fx"], frame["fy"], frame["cx"], frame["cy"],
+            frame["rgb_image"],
+            zbuffer_tolerance,
+            depth_image=frame.get("depth_image"),
+            depth_threshold=depth_threshold,
+            erosion_px=erosion_px,
+            edge_threshold_mm=edge_threshold_mm,
+        )
+
+        if len(indices) == 0:
+            continue
+
+        # Filter by max distance
+        dist_mask = depths < max_distance
+        indices = indices[dist_mask]
+        colors = colors[dist_mask]
+
+        # Only color points that haven't been colored yet
+        new_mask = ~colored[indices]
+        new_idx = indices[new_mask]
+        best_colors[new_idx] = colors[new_mask]
+        colored[new_idx] = True
+
+        if (i + 1) % 20 == 0 or i == len(frames) - 1:
+            pct = np.sum(colored) / n * 100
+            print(f"  Frame {i + 1}/{len(frames)}: {pct:.1f}% colored")
+
+    stats = {
+        "total_points": n,
+        "colored_points": int(np.sum(colored)),
+        "coverage_pct": float(np.sum(colored) / n * 100),
+        "avg_frames_per_colored_point": 1.0,
+    }
+
+    return best_colors, stats
+
+
+def _center_weight(pixels, cx, cy, hw, hh):
+    """
+    Compute per-pixel weight based on distance from image center.
+    Points at the center get weight ~1.0, points at the edge get ~0.0.
+    Uses a cosine falloff for smooth transitions.
+    """
+    dx = (pixels[:, 0] - cx) / hw
+    dy = (pixels[:, 1] - cy) / hh
+    dist = np.sqrt(dx**2 + dy**2)
+    dist = np.clip(dist, 0, 1)
+    weight = 0.5 * (1.0 + np.cos(np.pi * dist))
+    return weight
+
+
+def color_points_center_weighted(points_world, frames, zbuffer_tolerance=0.05,
+                                  max_distance=10.0, default_color=(128, 128, 128),
+                                  depth_threshold=0.10, erosion_px=2,
+                                  edge_threshold_mm=300):
+    """
+    Color points using center-weighted blending.
+
+    Each frame contributes color weighted by how close the point projects
+    to the image center. This creates smooth transitions in overlap zones
+    (no jagged first-wins boundaries) without the blur of uniform averaging.
+    """
+    n = len(points_world)
+    color_sum = np.zeros((n, 3), dtype=np.float64)
+    weight_sum = np.zeros(n, dtype=np.float64)
+
+    for i, frame in enumerate(frames):
+        indices, colors, depths, pixels = color_points_from_frame(
+            points_world,
+            frame["T_cam_from_world"],
+            frame["fx"], frame["fy"], frame["cx"], frame["cy"],
+            frame["rgb_image"],
+            zbuffer_tolerance,
+            depth_image=frame.get("depth_image"),
+            depth_threshold=depth_threshold,
+            erosion_px=erosion_px,
+            edge_threshold_mm=edge_threshold_mm,
+        )
+
+        if len(indices) == 0:
+            continue
+
+        # Filter by max distance
+        dist_mask = depths < max_distance
+        indices = indices[dist_mask]
+        colors = colors[dist_mask]
+        pixels = pixels[dist_mask]
+
+        # Compute center-distance weight for each point
+        h, w = frame["rgb_image"].shape[:2]
+        weights = _center_weight(pixels, frame["cx"], frame["cy"], w / 2, h / 2)
+
+        # Accumulate weighted colors
+        np.add.at(color_sum, (indices, slice(None)),
+                  colors.astype(np.float64) * weights[:, np.newaxis])
+        np.add.at(weight_sum, indices, weights)
+
+        if (i + 1) % 20 == 0 or i == len(frames) - 1:
+            pct = np.sum(weight_sum > 0) / n * 100
+            print(f"  Frame {i + 1}/{len(frames)}: {pct:.1f}% colored")
+
+    # Compute weighted average
+    colored_mask = weight_sum > 0
+    best_colors = np.full((n, 3), default_color, dtype=np.uint8)
+    if np.any(colored_mask):
+        avg = color_sum[colored_mask] / weight_sum[colored_mask, np.newaxis]
+        best_colors[colored_mask] = np.clip(avg, 0, 255).astype(np.uint8)
+
+    stats = {
+        "total_points": n,
+        "colored_points": int(np.sum(colored_mask)),
+        "coverage_pct": float(np.sum(colored_mask) / n * 100),
+        "avg_frames_per_colored_point": float(
+            np.mean(weight_sum[colored_mask]) if np.any(colored_mask) else 0
         ),
     }
 
