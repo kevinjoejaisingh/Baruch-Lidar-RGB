@@ -13,7 +13,9 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -329,31 +331,36 @@ def load_d455_depth(scan_dir, frame_num):
     return cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
 
 
+def _load_frame(args):
+    """Load and undistort a single frame (worker for parallel loading)."""
+    i, scan_dir, frame_num, data = args
+    rgb = load_d455_image(scan_dir, frame_num)
+    if rgb is None:
+        return None
+    if data["dist_coeffs"] is not None:
+        rgb = cv2.undistort(rgb, data["camera_matrix"], data["dist_coeffs"])
+    T_cam = compute_camera_pose_in_lidar_frame(i, data)
+    depth = load_d455_depth(scan_dir, frame_num)
+    return {
+        "T_cam_from_world": T_cam,
+        "rgb_image": rgb,
+        "depth_image": depth,
+        "fx": data["fx"], "fy": data["fy"],
+        "cx": data["cx"], "cy": data["cy"],
+    }
+
+
 def project_all_frames(scan_dir, data, blend_mode="mean"):
     """Project all frames onto the point cloud."""
     n_frames = len(data["frame_numbers"])
     print(f"\nProjecting {n_frames} frames onto {len(data['points']):,} points...")
 
-    frames = []
-    for i in range(n_frames):
-        frame_num = data["frame_numbers"][i]
-        rgb = load_d455_image(scan_dir, frame_num)
-        if rgb is None:
-            continue
-
-        if data["dist_coeffs"] is not None:
-            rgb = cv2.undistort(rgb, data["camera_matrix"], data["dist_coeffs"])
-
-        T_cam = compute_camera_pose_in_lidar_frame(i, data)
-        depth = load_d455_depth(scan_dir, frame_num)
-
-        frames.append({
-            "T_cam_from_world": T_cam,
-            "rgb_image": rgb,
-            "depth_image": depth,
-            "fx": data["fx"], "fy": data["fy"],
-            "cx": data["cx"], "cy": data["cy"],
-        })
+    n_workers = min(os.cpu_count() or 4, n_frames)
+    args_list = [(i, scan_dir, data["frame_numbers"][i], data) for i in range(n_frames)]
+    print(f"  Loading {n_frames} frames using {n_workers} threads...")
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        loaded = list(executor.map(_load_frame, args_list))
+    frames = [f for f in loaded if f is not None]
 
     print(f"  {len(frames)} frames with images loaded")
 

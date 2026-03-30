@@ -2,8 +2,27 @@
 Camera projection and Z-buffer utilities for coloring LiDAR points from RGB images.
 """
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import cv2
 import numpy as np
+
+
+def _project_frame_worker(args):
+    """Worker for parallel per-frame projection."""
+    points_world, frame, zbuffer_tolerance, depth_threshold, erosion_px, edge_threshold_mm = args
+    return color_points_from_frame(
+        points_world,
+        frame["T_cam_from_world"],
+        frame["fx"], frame["fy"], frame["cx"], frame["cy"],
+        frame["rgb_image"],
+        zbuffer_tolerance,
+        depth_image=frame.get("depth_image"),
+        depth_threshold=depth_threshold,
+        erosion_px=erosion_px,
+        edge_threshold_mm=edge_threshold_mm,
+    )
 
 
 def project_points_to_image(points_world, T_cam_from_world, fx, fy, cx, cy, image_h, image_w):
@@ -262,19 +281,16 @@ def color_points_multi_frame(points_world, frames, zbuffer_tolerance=0.05,
     color_sum = np.zeros((n, 3), dtype=np.float64)
     color_count = np.zeros(n, dtype=np.int32)
 
-    for i, frame in enumerate(frames):
-        indices, colors, depths, pixels = color_points_from_frame(
-            points_world,
-            frame["T_cam_from_world"],
-            frame["fx"], frame["fy"], frame["cx"], frame["cy"],
-            frame["rgb_image"],
-            zbuffer_tolerance,
-            depth_image=frame.get("depth_image"),
-            depth_threshold=depth_threshold,
-            erosion_px=erosion_px,
-            edge_threshold_mm=edge_threshold_mm,
-        )
+    n_workers = min(os.cpu_count() or 4, len(frames))
+    args_list = [
+        (points_world, frame, zbuffer_tolerance, depth_threshold, erosion_px, edge_threshold_mm)
+        for frame in frames
+    ]
+    print(f"  Projecting {len(frames)} frames using {n_workers} threads...")
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        results = list(executor.map(_project_frame_worker, args_list))
 
+    for i, (indices, colors, depths, pixels) in enumerate(results):
         if len(indices) == 0:
             continue
 
@@ -326,19 +342,16 @@ def color_points_closest_camera(points_world, frames, zbuffer_tolerance=0.05,
     best_depth = np.full(n, np.inf, dtype=np.float64)
     color_count = np.zeros(n, dtype=np.int32)
 
-    for i, frame in enumerate(frames):
-        indices, colors, depths, pixels = color_points_from_frame(
-            points_world,
-            frame["T_cam_from_world"],
-            frame["fx"], frame["fy"], frame["cx"], frame["cy"],
-            frame["rgb_image"],
-            zbuffer_tolerance,
-            depth_image=frame.get("depth_image"),
-            depth_threshold=depth_threshold,
-            erosion_px=erosion_px,
-            edge_threshold_mm=edge_threshold_mm,
-        )
+    n_workers = min(os.cpu_count() or 4, len(frames))
+    args_list = [
+        (points_world, frame, zbuffer_tolerance, depth_threshold, erosion_px, edge_threshold_mm)
+        for frame in frames
+    ]
+    print(f"  Projecting {len(frames)} frames using {n_workers} threads...")
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        results = list(executor.map(_project_frame_worker, args_list))
 
+    for i, (indices, colors, depths, pixels) in enumerate(results):
         if len(indices) == 0:
             continue
 
@@ -382,19 +395,16 @@ def color_points_first_wins(points_world, frames, zbuffer_tolerance=0.05,
     best_colors = np.full((n, 3), default_color, dtype=np.uint8)
     colored = np.zeros(n, dtype=bool)
 
-    for i, frame in enumerate(frames):
-        indices, colors, depths, pixels = color_points_from_frame(
-            points_world,
-            frame["T_cam_from_world"],
-            frame["fx"], frame["fy"], frame["cx"], frame["cy"],
-            frame["rgb_image"],
-            zbuffer_tolerance,
-            depth_image=frame.get("depth_image"),
-            depth_threshold=depth_threshold,
-            erosion_px=erosion_px,
-            edge_threshold_mm=edge_threshold_mm,
-        )
+    n_workers = min(os.cpu_count() or 4, len(frames))
+    args_list = [
+        (points_world, frame, zbuffer_tolerance, depth_threshold, erosion_px, edge_threshold_mm)
+        for frame in frames
+    ]
+    print(f"  Projecting {len(frames)} frames using {n_workers} threads...")
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        results = list(executor.map(_project_frame_worker, args_list))
 
+    for i, (indices, colors, depths, pixels) in enumerate(results):
         if len(indices) == 0:
             continue
 
@@ -452,19 +462,16 @@ def color_points_center_weighted(points_world, frames, zbuffer_tolerance=0.05,
     color_sum = np.zeros((n, 3), dtype=np.float64)
     weight_sum = np.zeros(n, dtype=np.float64)
 
-    for i, frame in enumerate(frames):
-        indices, colors, depths, pixels = color_points_from_frame(
-            points_world,
-            frame["T_cam_from_world"],
-            frame["fx"], frame["fy"], frame["cx"], frame["cy"],
-            frame["rgb_image"],
-            zbuffer_tolerance,
-            depth_image=frame.get("depth_image"),
-            depth_threshold=depth_threshold,
-            erosion_px=erosion_px,
-            edge_threshold_mm=edge_threshold_mm,
-        )
+    n_workers = min(os.cpu_count() or 4, len(frames))
+    args_list = [
+        (points_world, frame, zbuffer_tolerance, depth_threshold, erosion_px, edge_threshold_mm)
+        for frame in frames
+    ]
+    print(f"  Projecting {len(frames)} frames using {n_workers} threads...")
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        results = list(executor.map(_project_frame_worker, args_list))
 
+    for i, (indices, colors, depths, pixels) in enumerate(results):
         if len(indices) == 0:
             continue
 
@@ -475,8 +482,8 @@ def color_points_center_weighted(points_world, frames, zbuffer_tolerance=0.05,
         pixels = pixels[dist_mask]
 
         # Compute center-distance weight for each point
-        h, w = frame["rgb_image"].shape[:2]
-        weights = _center_weight(pixels, frame["cx"], frame["cy"], w / 2, h / 2)
+        h, w = frames[i]["rgb_image"].shape[:2]
+        weights = _center_weight(pixels, frames[i]["cx"], frames[i]["cy"], w / 2, h / 2)
 
         # Accumulate weighted colors
         np.add.at(color_sum, (indices, slice(None)),
