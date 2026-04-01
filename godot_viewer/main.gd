@@ -5,7 +5,7 @@ extends Node3D
 @export var sprint_multiplier: float = 3.0
 @export var mouse_sensitivity: float = 0.003
 @export var smoothing: float = 12.0
-@export_range(1.0, 20.0) var point_size: float = 2.0
+@export_range(0.5, 30.0) var point_size: float = 3.0
 
 # ── Nodes ───────────────────────────────────────────────────────────────────
 var camera: Camera3D
@@ -346,13 +346,17 @@ func _input(event: InputEvent) -> void:
 			rot.x = clampf(rot.x, -PI * 0.45, PI * 0.45)
 			camera.rotation = rot
 
-	# Right-click drag to look
+	# Right-click drag to look + scroll wheel for point size
 	if event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_RIGHT:
 			right_mouse_held = event.pressed
 		if event.button_index == MOUSE_BUTTON_LEFT and event.pressed and not mouse_captured and cloud_loaded:
 			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 			mouse_captured = true
+		if event.button_index == MOUSE_BUTTON_WHEEL_UP and event.pressed and cloud_loaded:
+			_set_point_size(minf(point_size + 0.5, 30.0))
+		if event.button_index == MOUSE_BUTTON_WHEEL_DOWN and event.pressed and cloud_loaded:
+			_set_point_size(maxf(point_size - 0.5, 0.5))
 
 	# Touchpad pan gesture
 	if event is InputEventPanGesture and not loading:
@@ -375,10 +379,15 @@ func _input(event: InputEvent) -> void:
 			KEY_1: _set_point_size(1.0)
 			KEY_2: _set_point_size(2.0)
 			KEY_3: _set_point_size(3.0)
-			KEY_4: _set_point_size(4.0)
-			KEY_5: _set_point_size(5.0)
-			KEY_6: _set_point_size(8.0)
-			KEY_7: _set_point_size(12.0)
+			KEY_4: _set_point_size(5.0)
+			KEY_5: _set_point_size(8.0)
+			KEY_6: _set_point_size(12.0)
+			KEY_7: _set_point_size(16.0)
+			KEY_8: _set_point_size(20.0)
+			KEY_9: _set_point_size(25.0)
+			KEY_0: _set_point_size(30.0)
+			KEY_BRACKETRIGHT: _set_point_size(minf(point_size + 1.0, 30.0))
+			KEY_BRACKETLEFT: _set_point_size(maxf(point_size - 1.0, 0.5))
 			KEY_EQUAL: move_speed *= 1.5; _show_status("Speed: %.1f" % move_speed)
 			KEY_MINUS: move_speed /= 1.5; _show_status("Speed: %.1f" % move_speed)
 
@@ -387,7 +396,7 @@ func _set_point_size(size: float) -> void:
 	point_size = size
 	if cloud_material:
 		cloud_material.set_shader_parameter("point_size", size)
-	_show_status("Point size: %.0f" % size)
+	_show_status("Point size: %.1f  (scroll/[]/1-0 to adjust)" % size)
 
 
 func _show_status(text: String) -> void:
