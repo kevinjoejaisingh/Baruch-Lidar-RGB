@@ -25,3 +25,15 @@ DepthCapture_*.png
 
 # Walk viewer (superseded by Godot viewer)
 walk_viewer.py
+
+# YC demo build output
+dist/
+
+# imgui runtime state
+imgui.ini
+
+# Local tooling
+.claude/
+
+# Point clouds — never track raw data
+*.ply
